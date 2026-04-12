@@ -3,7 +3,7 @@
  * Plugin Name: xAPI Statement Monitor
  * Plugin URI:  https://github.com/barryschoedel/xapi-statement-monitor
  * Description: Diagnoses xAPI completion tracking failures on LearnDash + Tin Canny sites. Intercepts, logs, and analyzes every xAPI statement in the pipeline from Articulate Rise (and other xAPI content) through Tin Canny to LearnDash completion.
- * Version:     1.0.1
+ * Version:     1.0.2
  * Author:      Barry Schoedel
  * Author URI:  https://schoedel.design/
  * License:     GPL-2.0+
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONSTANTS
 // ============================================================
-define( 'XAPI_MONITOR_VERSION',    '1.0.1' );
+define( 'XAPI_MONITOR_VERSION',    '1.0.2' );
 define( 'XAPI_MONITOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_FILE', __FILE__ );
@@ -620,25 +620,53 @@ class XAPI_Monitor {
     }
 
     private function render_beacon_script( string $nonce, string $beacon_url, int $user_id ): void {
+        // Pass the beacon URL to JS so it can exclude itself from interception.
+        $beacon_url_js = rest_url( 'xapi-monitor/v1/beacon' );
         ?>
 <script id="xapi-monitor-beacon" type="text/javascript">
 (function() {
     'use strict';
 
-    var BEACON_URL   = <?php echo wp_json_encode( $beacon_url ); ?>;
+    var BEACON_URL   = <?php echo wp_json_encode( $beacon_url_js ); ?>;
     var BEACON_NONCE = <?php echo wp_json_encode( $nonce ); ?>;
     var USER_ID      = <?php echo (int) $user_id; ?>;
 
-    // Pattern to detect xAPI endpoint calls
+    // ---------------------------------------------------------------------------
+    // URL MATCHING — deliberately narrow to avoid false positives.
+    //
+    // REMOVED  /xapi/i    — too broad: matched the beacon's own URL
+    //                        (/xapi-monitor/v1/beacon) causing an infinite loop
+    //                        where the beacon intercepted its own POST and sent
+    //                        another beacon about it, recursively.
+    //
+    // REMOVED  /statements/i — too broad: matched any URL containing the word
+    //                          "statements" (JS filenames, font URLs, REST routes
+    //                          unrelated to xAPI statement delivery).
+    //
+    // KEPT     /ucTinCan/i  — specific to the Tin Canny virtual endpoint.
+    // KEPT     /tincan/i    — specific enough; covers ucTinCan and tincan paths.
+    // ADDED    exact path suffixes for known xAPI LRS statement endpoints.
+    // ---------------------------------------------------------------------------
     var XAPI_PATTERNS = [
         /ucTinCan/i,
-        /xapi/i,
         /tincan/i,
-        /statements/i
+        /\/statements\//,        // xAPI LRS path segment (e.g. /xapi/statements/)
+        /[?&]ucTinCan/i          // query-string form (?ucTinCan=1)
+    ];
+
+    // Hard exclusions — URLs that must NEVER be intercepted regardless of pattern match.
+    // Prevents the beacon from intercepting its own outbound POST (infinite loop).
+    var EXCLUSIONS = [
+        BEACON_URL
     ];
 
     function isXapiUrl(url) {
         if (!url) return false;
+        // Exclude the beacon's own endpoint first
+        for (var i = 0; i < EXCLUSIONS.length; i++) {
+            if (url.indexOf(EXCLUSIONS[i]) !== -1) return false;
+        }
+        // Must be a POST to a recognised xAPI delivery URL
         return XAPI_PATTERNS.some(function(p) { return p.test(url); });
     }
 
@@ -684,54 +712,42 @@ class XAPI_Monitor {
         var meta = this._xapiMonitor || {};
 
         if (isXapiUrl(meta.url) && meta.method === 'POST') {
-            var startTime = Date.now();
-            var origOnReadyStateChange = this.onreadystatechange;
+            var startTime  = Date.now();
+            var beaconSent = false; // guard: only send once per request
 
-            this.onreadystatechange = function() {
-                if (self.readyState === 4) {
-                    var elapsed = Date.now() - startTime;
-                    var statementData = {};
-                    try {
-                        var parsed = JSON.parse(body);
-                        if (Array.isArray(parsed)) parsed = parsed[0];
-                        if (parsed && parsed.verb) {
-                            statementData.verb_id      = parsed.verb.id || '';
-                            statementData.activity_id  = (parsed.object && parsed.object.id) ? parsed.object.id : '';
-                        }
-                    } catch(e) {}
-
-                    sendBeacon(Object.assign({
-                        source:        'xhr_intercept',
-                        url:           meta.url,
-                        status_code:   self.status,
-                        response_text: self.status >= 400 ? (self.responseText || '').substring(0, 500) : '',
-                        elapsed_ms:    elapsed,
-                        timed_out:     elapsed > 10000
-                    }, statementData));
+            var statementData = {};
+            try {
+                var parsed = JSON.parse(body);
+                if (Array.isArray(parsed)) parsed = parsed[0];
+                if (parsed && parsed.verb) {
+                    statementData.verb_id     = parsed.verb.id || '';
+                    statementData.activity_id = (parsed.object && parsed.object.id) ? parsed.object.id : '';
                 }
-                if (origOnReadyStateChange) {
-                    origOnReadyStateChange.apply(self, arguments);
-                }
-            };
+            } catch(e) {}
 
-            // Also handle the load event
-            this.addEventListener('load', function() {});
-            this.addEventListener('error', function() {
+            function reportXhr(status) {
+                if (beaconSent) return;
+                beaconSent = true;
                 sendBeacon(Object.assign({
-                    source:      'xhr_intercept',
-                    url:         meta.url,
-                    status_code: 0,
-                    error:       'network_error',
-                    elapsed_ms:  Date.now() - startTime
-                }));
-            });
-            this.addEventListener('timeout', function() {
-                sendBeacon(Object.assign({
-                    source:    'xhr_intercept',
-                    url:       meta.url,
-                    timed_out: true,
-                    elapsed_ms: Date.now() - startTime
-                }));
+                    source:        'xhr_intercept',
+                    url:           meta.url,
+                    status_code:   status,
+                    response_text: status >= 400 ? (self.responseText || '').substring(0, 500) : '',
+                    elapsed_ms:    Date.now() - startTime,
+                    timed_out:     (Date.now() - startTime) > 10000
+                }, statementData));
+            }
+
+            // Use addEventListener (not onreadystatechange replacement) so we
+            // don't break Rise's own handler even if it is set after send().
+            this.addEventListener('load', function() { reportXhr(self.status); });
+            this.addEventListener('error', function() { reportXhr(0); });
+            this.addEventListener('timeout', function() { reportXhr(0); });
+
+            // Fallback: also watch readystatechange in case 'load' doesn't fire
+            // (some older browsers / XHR implementations).
+            this.addEventListener('readystatechange', function() {
+                if (self.readyState === 4) { reportXhr(self.status); }
             });
         }
         origSend.apply(this, arguments);
@@ -891,30 +907,46 @@ class XAPI_Monitor {
         }
     }
 
-    // Hook existing iframes
+    // Hook existing iframes.
+    // IMPORTANT: Never access contentDocument synchronously in a MutationObserver
+    // callback or before the 'load' event — it blocks the DOM mutation queue
+    // that Rise uses to render slides, causing the module to appear stuck.
     document.querySelectorAll('iframe').forEach(function(iframe) {
-        if (iframe.contentDocument) {
-            hookIframe(iframe);
+        // Always attach via load event, never synchronously.
+        // If the iframe is already complete, the load event has already fired,
+        // so we use a short async defer to avoid blocking the current call stack.
+        if (iframe.complete || (iframe.contentDocument && iframe.contentDocument.readyState === 'complete')) {
+            setTimeout(function() { hookIframe(iframe); }, 0);
         } else {
-            iframe.addEventListener('load', function() { hookIframe(iframe); });
+            iframe.addEventListener('load', function() {
+                // Defer by one tick so the iframe's own load handlers run first
+                setTimeout(function() { hookIframe(iframe); }, 0);
+            });
         }
     });
 
-    // Watch for dynamically added iframes
+    // Watch for dynamically added iframes (e.g. Tin Canny injecting the Rise iframe).
+    // Only attach a 'load' listener — never access contentDocument in the observer
+    // callback itself, as the iframe hasn't loaded yet at that point.
     var observer = new MutationObserver(function(mutations) {
         mutations.forEach(function(mutation) {
             mutation.addedNodes.forEach(function(node) {
+                if (node.nodeType !== 1) return; // element nodes only
                 if (node.tagName === 'IFRAME') {
-                    node.addEventListener('load', function() { hookIframe(node); });
-                }
-                if (node.querySelectorAll) {
+                    node.addEventListener('load', function() {
+                        setTimeout(function() { hookIframe(node); }, 0);
+                    });
+                } else if (node.querySelectorAll) {
                     node.querySelectorAll('iframe').forEach(function(iframe) {
-                        iframe.addEventListener('load', function() { hookIframe(iframe); });
+                        iframe.addEventListener('load', function() {
+                            setTimeout(function() { hookIframe(iframe); }, 0);
+                        });
                     });
                 }
             });
         });
     });
+    // childList + subtree is sufficient; avoid attributeFilter on all nodes.
     observer.observe(document.body, { childList: true, subtree: true });
 
     // -------------------------------------------------------

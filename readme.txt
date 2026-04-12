@@ -4,7 +4,7 @@ Tags: xapi, learndash, tin-canny, lrs, elearning
 Requires at least: 6.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 1.0.1
+Stable tag: 1.0.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -115,6 +115,12 @@ By default, 30 days. Configurable in Settings. You can also export to CSV before
 5. Settings — configure alerts, thresholds, and monitoring behavior
 
 == Changelog ==
+
+= 1.0.2 =
+* Fix: JavaScript beacon's URL patterns (`/xapi/i`, `/statements/i`) were too broad, intercepting the beacon's own endpoint (creating an infinite loop) and unrelated network requests (JS files, font URLs).
+* Fix: XHR `onreadystatechange` replacement broke Rise content that sets its handler after `send()`. Replaced with `addEventListener` to avoid interfering with Rise's XHR lifecycle.
+* Fix: Synchronous `contentDocument` access in MutationObserver blocked the DOM mutation queue Rise uses to render slides, causing modules to appear stuck. All iframe hooks now deferred to after the `load` event.
+* Fix: MutationObserver lacked `nodeType` check, causing errors on text/comment nodes.
 
 = 1.0.1 =
 * Fix: `rest_pre_dispatch` hook was intercepting all REST API requests including WordPress Site Health checks and dashboard widget endpoints, causing the WP dashboard health-check spinner to stall and info module accordions to become unresponsive. Now exits immediately for all non-Tin-Canny routes.

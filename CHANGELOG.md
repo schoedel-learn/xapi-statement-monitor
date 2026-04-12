@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-04-12
+
+### Fixed
+- **Critical (JS):** `XAPI_PATTERNS` included `/xapi/i` which matched the beacon's own REST endpoint URL (`/xapi-monitor/v1/beacon`), causing the beacon to intercept its own outgoing POST and fire another beacon about it — an infinite self-monitoring loop generating garbage log entries.
+- **Critical (JS):** `/statements/i` pattern was too broad — matched any URL containing the word "statements" including JS filenames, font URLs, and unrelated REST routes, causing spurious xAPI intercepts on non-xAPI network requests.
+- **Critical (JS):** `onreadystatechange` was replaced on the XHR prototype rather than using `addEventListener`. This broke Rise content that sets `onreadystatechange` *after* `send()` — a valid pattern — because our replacement wrapped the handler that existed *at send() time* only, dropping any later-assigned handler. Replaced with `addEventListener('load')` + `addEventListener('readystatechange')` with a `beaconSent` guard to prevent duplicate reports.
+- **Moderate (JS):** `hookIframe()` was called synchronously in the MutationObserver callback and on existing iframes via `if (iframe.contentDocument)` — before the iframe had finished loading. Accessing `contentDocument` prematurely blocks the browser's DOM mutation queue, which Rise uses to render slides, causing modules to appear stuck or not progress. All iframe hooks are now deferred with `setTimeout(fn, 0)` after the `load` event.
+- **Minor (JS):** MutationObserver callback did not check `node.nodeType` before accessing `node.tagName`, causing errors on text/comment nodes.
+
 ## [1.0.1] - 2026-04-12
 
 ### Fixed
