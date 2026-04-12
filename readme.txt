@@ -4,7 +4,7 @@ Tags: xapi, learndash, tin-canny, lrs, elearning
 Requires at least: 6.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -115,6 +115,10 @@ By default, 30 days. Configurable in Settings. You can also export to CSV before
 5. Settings — configure alerts, thresholds, and monitoring behavior
 
 == Changelog ==
+
+= 1.0.1 =
+* Fix: `rest_pre_dispatch` hook was intercepting all REST API requests including WordPress Site Health checks and dashboard widget endpoints, causing the WP dashboard health-check spinner to stall and info module accordions to become unresponsive. Now exits immediately for all non-Tin-Canny routes.
+* Fix: Added guard to prevent recursive interception of the plugin's own beacon REST endpoint.
 
 = 1.0.0 =
 * Initial public release

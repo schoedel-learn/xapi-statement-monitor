@@ -3,7 +3,7 @@
  * Plugin Name: xAPI Statement Monitor
  * Plugin URI:  https://github.com/barryschoedel/xapi-statement-monitor
  * Description: Diagnoses xAPI completion tracking failures on LearnDash + Tin Canny sites. Intercepts, logs, and analyzes every xAPI statement in the pipeline from Articulate Rise (and other xAPI content) through Tin Canny to LearnDash completion.
- * Version:     1.0.0
+ * Version:     1.0.1
  * Author:      Barry Schoedel
  * Author URI:  https://schoedel.design/
  * License:     GPL-2.0+
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONSTANTS
 // ============================================================
-define( 'XAPI_MONITOR_VERSION',    '1.0.0' );
+define( 'XAPI_MONITOR_VERSION',    '1.0.1' );
 define( 'XAPI_MONITOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_FILE', __FILE__ );
@@ -385,7 +385,28 @@ class XAPI_Monitor {
      * @return mixed Unchanged $result.
      */
     public function intercept_rest_request( $result, WP_REST_Server $server, WP_REST_Request $request ) {
+        // IMPORTANT: This hook fires on EVERY REST request (site-health checks,
+        // dashboard widgets, Heartbeat, our own beacon, etc.). Return immediately
+        // for anything that is not a Tin Canny xAPI endpoint — doing any work here
+        // on unrelated requests was causing the WP dashboard health-check spinner
+        // to stall and dashboard info modules to not respond.
         $route = $request->get_route();
+
+        // Hard-coded fast-path exclusions — bail immediately on known WP core routes
+        // that must never be slowed down.
+        $excluded_prefixes = [
+            '/wp/v2',
+            '/wp-site-health',
+            '/wp/v1',
+            '/oembed',
+            '/xapi-monitor', // Our own beacon — must not create a recursive loop
+            '/wp-block-editor',
+        ];
+        foreach ( $excluded_prefixes as $prefix ) {
+            if ( 0 === strpos( $route, $prefix ) ) {
+                return $result;
+            }
+        }
 
         // Only intercept Tin Canny xAPI endpoint
         if ( false === strpos( $route, 'ucTinCan' ) &&
