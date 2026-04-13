@@ -3,15 +3,15 @@
  * Plugin Name: xAPI Statement Monitor
  * Plugin URI:  https://github.com/barryschoedel/xapi-statement-monitor
  * Description: Diagnoses xAPI completion tracking failures on LearnDash + Tin Canny sites. Intercepts, logs, and analyzes every xAPI statement in the pipeline from Articulate Rise (and other xAPI content) through Tin Canny to LearnDash completion.
- * Version:     1.0.3
+ * Version:     1.1.0
  * Author:      Barry Schoedel
  * Author URI:  https://schoedel.design/
  * License:     GPL-2.0+
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: xapi-monitor
  * Requires at least: 6.0
- * Requires PHP: 7.4
- * Tested up to: 6.7
+ * Requires PHP: 8.0
+ * Tested up to: 6.9
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONSTANTS
 // ============================================================
-define( 'XAPI_MONITOR_VERSION',    '1.0.3' );
+define( 'XAPI_MONITOR_VERSION',    '1.1.0' );
 define( 'XAPI_MONITOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_FILE', __FILE__ );
@@ -1389,6 +1389,37 @@ class XAPI_Monitor {
                 $this->maybe_send_alert_emails();
             }
         }
+
+        // LearnDash REST API health check (critical for LearnDash 5.0+)
+        if ( defined( 'LEARNDASH_VERSION' ) || function_exists( 'learndash_is_lesson_complete' ) ) {
+            $ld_result = $this->check_learndash_rest_api();
+            update_option( 'xapi_monitor_last_learndash_api_check', [
+                'timestamp' => current_time( 'mysql' ),
+                'result'    => $ld_result,
+            ] );
+
+            if ( 'error' === $ld_result['status'] ) {
+                $existing_ld = $this->db->get_var(
+                    "SELECT id FROM {$this->alerts_table}
+                     WHERE alert_type = 'learndash_api_failure'
+                       AND resolved = 0
+                       AND timestamp > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                     LIMIT 1"
+                );
+                if ( ! $existing_ld ) {
+                    $this->create_alert( [
+                        'alert_type'      => 'learndash_api_failure',
+                        'severity'        => 'critical',
+                        'user_id'         => 0,
+                        'course_id'       => 0,
+                        'lesson_id'       => 0,
+                        'message'         => $ld_result['message'],
+                        'diagnostic_data' => wp_json_encode( $ld_result ),
+                    ] );
+                    $this->maybe_send_alert_emails();
+                }
+            }
+        }
     }
 
     /**
@@ -1520,6 +1551,37 @@ class XAPI_Monitor {
         ];
     }
 
+    /**
+     * Check LearnDash REST API v2 endpoint reachability.
+     */
+    private function check_learndash_rest_api(): array {
+        $endpoint = rest_url( 'ldlms/v2/sfwd-lessons' );
+        $response = wp_remote_get( $endpoint, [
+            'timeout'    => 10,
+            'user-agent' => 'xAPI-Monitor/' . XAPI_MONITOR_VERSION . '; WordPress/' . get_bloginfo( 'version' ),
+        ] );
+
+        if ( is_wp_error( $response ) ) {
+            return [
+                'status'  => 'error',
+                'message' => 'LearnDash REST API unreachable: ' . $response->get_error_message(),
+                'code'    => 0,
+            ];
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        // 200 = OK, 401 = auth required but API is up (acceptable for unauthenticated check)
+        $ok = in_array( $code, [ 200, 401 ], true );
+
+        return [
+            'status'  => $ok ? 'ok' : 'error',
+            'message' => $ok
+                ? sprintf( 'LearnDash REST API reachable (HTTP %d)', $code )
+                : sprintf( 'LearnDash REST API returned unexpected HTTP %d', $code ),
+            'code'    => $code,
+        ];
+    }
+
     // ============================================================
     // SECTION 6: ALERT HELPERS
     // ============================================================
@@ -1648,6 +1710,7 @@ class XAPI_Monitor {
             'statement_gap'       => "1. The user may have abandoned the course mid-way.\n2. Check if the Rise content sent a completion statement via the JS Beacon tab.\n3. If the content did complete on the client side but the server didn't receive it, consider resending the last captured statement.",
             'high_failure_rate'   => "1. Check server error logs for 500/503 errors.\n2. Verify the database is accepting writes.\n3. Check for any recent WordPress updates or plugin conflicts.\n4. Review the Live Statement Feed for patterns in the failures.",
             'user_stuck'          => "1. Check the user's xAPI statement trail in the User Diagnostic tab.\n2. Verify they are enrolled in the course.\n3. Consider resetting their xAPI data so they can restart.",
+            'learndash_api_failure' => "1. Verify LearnDash is active and updated to version 5.0+.\n2. Check that the REST API is not blocked by a security plugin or .htaccess rule.\n3. Visit /wp-json/ldlms/v2/sfwd-lessons in your browser to test manually.\n4. Check for conflicting plugins that may disable the REST API.",
         ];
         return $actions[ $type ] ?? 'Review the alert details in the xAPI Monitor admin dashboard.';
     }
@@ -2970,6 +3033,39 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
             </table>
         <?php else : ?>
             <p style="color:#888"><?php esc_html_e( 'No endpoint health check has been run yet. Click "Test Endpoint Now" above.', 'xapi-monitor' ); ?></p>
+        <?php endif; ?>
+
+        <?php // LearnDash REST API Status ?>
+        <?php $ld_api_check = get_option( 'xapi_monitor_last_learndash_api_check', [] ); ?>
+        <?php if ( ! empty( $ld_api_check['result'] ) ) :
+            $ld = $ld_api_check['result'];
+            $ld_ok = ( $ld['status'] ?? '' ) === 'ok';
+            $ld_class = $ld_ok ? 'xapi-health-ok' : 'xapi-health-fail';
+            ?>
+            <div class="xapi-section-header" style="margin-top:24px"><?php esc_html_e( 'LearnDash REST API', 'xapi-monitor' ); ?></div>
+            <table class="wp-list-table widefat" style="max-width:600px">
+                <tr>
+                    <th style="width:200px"><?php esc_html_e( 'Last Check Time', 'xapi-monitor' ); ?></th>
+                    <td><?php echo esc_html( $ld_api_check['timestamp'] ?? '—' ); ?></td>
+                </tr>
+                <tr>
+                    <th><?php esc_html_e( 'Status', 'xapi-monitor' ); ?></th>
+                    <td><span class="xapi-health-check <?php echo esc_attr( $ld_class ); ?>"><?php echo $ld_ok ? '✅ ' . esc_html__( 'PASSING', 'xapi-monitor' ) : '❌ ' . esc_html__( 'FAILING', 'xapi-monitor' ); ?></span></td>
+                </tr>
+                <tr>
+                    <th><?php esc_html_e( 'Message', 'xapi-monitor' ); ?></th>
+                    <td style="<?php echo $ld_ok ? '' : 'color:#c0392b'; ?>"><?php echo esc_html( $ld['message'] ?? '—' ); ?></td>
+                </tr>
+                <?php if ( isset( $ld['code'] ) && $ld['code'] > 0 ) : ?>
+                <tr>
+                    <th><?php esc_html_e( 'HTTP Response', 'xapi-monitor' ); ?></th>
+                    <td><?php echo esc_html( $ld['code'] ); ?></td>
+                </tr>
+                <?php endif; ?>
+            </table>
+        <?php elseif ( defined( 'LEARNDASH_VERSION' ) || function_exists( 'learndash_is_lesson_complete' ) ) : ?>
+            <div class="xapi-section-header" style="margin-top:24px"><?php esc_html_e( 'LearnDash REST API', 'xapi-monitor' ); ?></div>
+            <p style="color:#888"><?php esc_html_e( 'No LearnDash REST API check has been run yet. It will run automatically on the next endpoint health cron cycle.', 'xapi-monitor' ); ?></p>
         <?php endif; ?>
 
         <?php // Quick Diagnostic Checks ?>
