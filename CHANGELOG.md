@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-01
+
+### Changed
+- Bumped "Tested up to" to WordPress 6.9 (compatible with 6.9.4 security releases)
+- Updated "Requires PHP" to 8.0 (PHP 7.4 reached end-of-life November 2022)
+
+### Added
+- **System Health: LearnDash REST API check** — The diagnostic engine now verifies that the LearnDash v2 REST API (`/wp-json/ldlms/v2/sfwd-lessons`) is reachable and returning a valid response on every cron run. Failures are surfaced in the System Health tab and trigger the standard alert pipeline. This is critical for sites running LearnDash 5.0+, where the REST API became the production-ready backbone for completion tracking and integrations.
+- **Tin Canny filter documentation in readme** — Added note about `tincanny_module_allow_db_capture` filter (enhanced in Tin Canny 5.1.3) for admins to reduce xAPI statement DB bloat.
+
 ## [1.0.3] - 2026-04-13
 
 ### Fixed / Added

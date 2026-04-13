@@ -16,3 +16,8 @@ vendor/
 # Local dev
 .env
 wp-config.php
+
+# Coding agent internal files — never commit
+.claude/
+.mcp.json
+CLAUDE.md

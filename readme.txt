@@ -2,9 +2,9 @@
 Contributors: barryschoedel
 Tags: xapi, learndash, tin-canny, lrs, elearning
 Requires at least: 6.0
-Tested up to: 6.7
-Requires PHP: 7.4
-Stable tag: 1.0.3
+Tested up to: 6.9
+Requires PHP: 8.0
+Stable tag: 1.1.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -40,7 +40,7 @@ This plugin makes those invisible failures visible.
 = Requirements =
 
 * WordPress 6.0+
-* PHP 7.4+
+* PHP 8.0+
 * [LearnDash LMS](https://www.learndash.com/)
 * [Tin Canny Reporting for LearnDash](https://www.uncannyowl.com/downloads/tin-canny-learndash-reporting/) (Uncanny Owl)
 * xAPI content (Articulate Rise, Storyline, or any xAPI-compliant authoring tool)
@@ -60,6 +60,18 @@ This plugin makes those invisible failures visible.
 * **Troubleshooting** — A learner reports their course shows incomplete. Search their user profile in the diagnostic tab to see exactly which xAPI verbs were received, whether Tin Canny processed them, and whether LearnDash was notified.
 * **Monitoring** — Set up email alerts so you know about completion failures before your users report them.
 * **Root Cause Analysis** — Determine whether failures are client-side (network issues, browser compatibility, iframe problems), server-side (Tin Canny not processing, endpoint down), or LMS-side (LearnDash not receiving the completion trigger).
+
+= Tin Canny Filter: Reducing xAPI Statement Bloat =
+Tin Canny 5.1.3+ supports a filter to skip specific xAPI events from being captured to the database.
+If you are seeing excessive DB rows in the Tin Canny reporting table, use the `tincanny_module_allow_db_capture`
+filter in a mu-plugin or your theme's functions.php to selectively skip low-value xAPI verbs (e.g., "initialized", "interacted"):
+
+add_filter( 'tincanny_module_allow_db_capture', function( $allow, $data ) {
+    if ( isset( $data['verb'] ) && in_array( $data['verb'], [ 'initialized', 'interacted' ], true ) ) {
+        return false;
+    }
+    return $allow;
+}, 10, 2 );
 
 == Installation ==
 
@@ -115,6 +127,12 @@ By default, 30 days. Configurable in Settings. You can also export to CSV before
 5. Settings — configure alerts, thresholds, and monitoring behavior
 
 == Changelog ==
+
+= 1.1.0 =
+* Tested up to WordPress 6.9 (compatible with 6.9.4 security releases)
+* Updated minimum PHP requirement to 8.0 (PHP 7.4 reached end-of-life November 2022)
+* Added LearnDash REST API health check to System Health diagnostics (LearnDash 5.0+ critical path)
+* Added readme note about Tin Canny 5.1.3's tincanny_module_allow_db_capture filter for reducing DB bloat
 
 = 1.0.2 =
 * Fix: JavaScript beacon's URL patterns (`/xapi/i`, `/statements/i`) were too broad, intercepting the beacon's own endpoint (creating an infinite loop) and unrelated network requests (JS files, font URLs).
