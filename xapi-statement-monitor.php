@@ -3,7 +3,7 @@
  * Plugin Name: xAPI Statement Monitor
  * Plugin URI:  https://github.com/barryschoedel/xapi-statement-monitor
  * Description: Diagnoses xAPI completion tracking failures on LearnDash + Tin Canny sites. Intercepts, logs, and analyzes every xAPI statement in the pipeline from Articulate Rise (and other xAPI content) through Tin Canny to LearnDash completion.
- * Version:     1.0.2
+ * Version:     1.0.3
  * Author:      Barry Schoedel
  * Author URI:  https://schoedel.design/
  * License:     GPL-2.0+
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONSTANTS
 // ============================================================
-define( 'XAPI_MONITOR_VERSION',    '1.0.2' );
+define( 'XAPI_MONITOR_VERSION',    '1.0.3' );
 define( 'XAPI_MONITOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_FILE', __FILE__ );
@@ -232,6 +232,7 @@ class XAPI_Monitor {
         add_action( 'wp_ajax_xapi_monitor_run_diagnostic',   [ $this, 'ajax_run_diagnostic' ] );
         add_action( 'wp_ajax_xapi_monitor_resolve_alert',    [ $this, 'ajax_resolve_alert' ] );
         add_action( 'wp_ajax_xapi_monitor_purge_logs',       [ $this, 'ajax_purge_logs' ] );
+        add_action( 'wp_ajax_xapi_monitor_delete_all_data',   [ $this, 'ajax_delete_all_data' ] );
         add_action( 'wp_ajax_xapi_monitor_test_endpoint',    [ $this, 'ajax_test_endpoint' ] );
         add_action( 'wp_ajax_xapi_monitor_export_csv',       [ $this, 'ajax_export_csv' ] );
 
@@ -1870,6 +1871,56 @@ class XAPI_Monitor {
         ] );
     }
 
+    /**
+     * AJAX: Permanently delete all plugin data (tables + options).
+     * Sets the wipe flag first so uninstall.php will also clean up
+     * if the admin then deletes the plugin.
+     */
+    public function ajax_delete_all_data(): void {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => 'Permission denied.' ] );
+            return;
+        }
+        if ( ! check_ajax_referer( 'xapi_monitor_delete_all_data', 'nonce', false ) ) {
+            wp_send_json_error( [ 'message' => 'Security check failed.' ] );
+            return;
+        }
+
+        // Drop log and alert tables.
+        $tables = [
+            $this->db->prefix . 'xapi_monitor_log',
+            $this->db->prefix . 'xapi_monitor_alerts',
+        ];
+        foreach ( $tables as $table ) {
+            // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            $this->db->query( "DROP TABLE IF EXISTS `{$table}`" );
+            // phpcs:enable
+        }
+
+        // Remove all plugin options.
+        $options = [
+            'xapi_monitor_version',
+            'xapi_monitor_settings',
+            'xapi_monitor_last_diagnostic',
+            'xapi_monitor_last_health_check',
+            'xapi_monitor_wipe_on_uninstall',
+        ];
+        foreach ( $options as $option ) {
+            delete_option( $option );
+        }
+
+        // Set the wipe flag so uninstall.php also cleans up if plugin is then deleted.
+        update_option( 'xapi_monitor_wipe_on_uninstall', true );
+
+        // Re-create empty tables immediately so the plugin keeps working.
+        self::create_tables();
+        add_option( 'xapi_monitor_version', XAPI_MONITOR_VERSION );
+        add_option( 'xapi_monitor_settings', self::default_settings() );
+        delete_option( 'xapi_monitor_wipe_on_uninstall' ); // Reset flag — fresh start.
+
+        wp_send_json_success( [ 'message' => 'All data has been permanently deleted. Tables have been recreated and the plugin is ready to collect new data.' ] );
+    }
+
     public function ajax_test_endpoint(): void {
         if ( ! $this->verify_admin_ajax() ) {
             return;
@@ -3291,6 +3342,63 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
             </label>
             <button class="button button-secondary" id="xapi-purge-logs"><?php esc_html_e( 'Purge Logs', 'xapi-monitor' ); ?></button>
         </div>
+
+        <hr style="margin:30px 0">
+        <h3 style="color:#a00"><?php esc_html_e( 'Danger Zone', 'xapi-monitor' ); ?></h3>
+
+        <div style="background:#fdf2f2;padding:16px;border:1px solid #c0392b;border-radius:4px;max-width:600px">
+            <p style="margin:0 0 8px">
+                <strong><?php esc_html_e( 'Data Preservation Notice', 'xapi-monitor' ); ?></strong><br>
+                <?php esc_html_e( 'Deactivating or updating this plugin never erases your monitoring data. Your xAPI statement logs and alerts are preserved across all plugin updates.', 'xapi-monitor' ); ?>
+            </p>
+            <p style="margin:0 0 12px;color:#555;font-size:13px">
+                <?php esc_html_e( 'Use the button below only if you want to permanently erase all captured statements, alerts, and settings. This cannot be undone.', 'xapi-monitor' ); ?>
+            </p>
+            <button class="button" id="xapi-delete-all-data" style="background:#c0392b;color:#fff;border-color:#a93226">
+                <?php esc_html_e( 'Delete All Data', 'xapi-monitor' ); ?>
+            </button>
+            <span id="xapi-delete-confirm" style="display:none;margin-left:12px">
+                <strong style="color:#a00"><?php esc_html_e( 'Are you sure? This will permanently erase all logs, alerts, and settings.', 'xapi-monitor' ); ?></strong>
+                <button class="button" id="xapi-delete-confirm-yes" style="margin-left:8px;background:#a00;color:#fff;border-color:#800"><?php esc_html_e( 'Yes, delete everything', 'xapi-monitor' ); ?></button>
+                <button class="button" id="xapi-delete-confirm-no" style="margin-left:4px"><?php esc_html_e( 'Cancel', 'xapi-monitor' ); ?></button>
+            </span>
+            <p id="xapi-delete-result" style="margin:8px 0 0;font-weight:600"></p>
+        </div>
+        <script>
+        (function(){
+            document.getElementById('xapi-delete-all-data').addEventListener('click', function(){
+                document.getElementById('xapi-delete-confirm').style.display = 'inline';
+            });
+            document.getElementById('xapi-delete-confirm-no').addEventListener('click', function(){
+                document.getElementById('xapi-delete-confirm').style.display = 'none';
+            });
+            document.getElementById('xapi-delete-confirm-yes').addEventListener('click', function(){
+                var btn = this;
+                btn.disabled = true;
+                btn.textContent = '<?php echo esc_js( __( 'Deleting…', 'xapi-monitor' ) ); ?>';
+                var nonce = '<?php echo esc_js( wp_create_nonce( 'xapi_monitor_delete_all_data' ) ); ?>';
+                fetch(ajaxurl, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'action=xapi_monitor_delete_all_data&nonce=' + encodeURIComponent(nonce)
+                })
+                .then(function(r){ return r.json(); })
+                .then(function(data){
+                    document.getElementById('xapi-delete-confirm').style.display = 'none';
+                    var el = document.getElementById('xapi-delete-result');
+                    if (data.success) {
+                        el.style.color = 'green';
+                        el.textContent = data.data.message;
+                    } else {
+                        el.style.color = '#a00';
+                        el.textContent = (data.data && data.data.message) ? data.data.message : '<?php echo esc_js( __( 'Error. Please try again.', 'xapi-monitor' ) ); ?>';
+                        btn.disabled = false;
+                        btn.textContent = '<?php echo esc_js( __( 'Yes, delete everything', 'xapi-monitor' ) ); ?>';
+                    }
+                });
+            });
+        })();
+        </script>
         <?php
     }
 }

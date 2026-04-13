@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-04-13
+
+### Fixed / Added
+- **Data preservation across updates:** Plugin deletion no longer automatically drops the `xapi_monitor_log` or `xapi_monitor_alerts` tables. Monitoring history is preserved through every deactivate → delete → reinstall cycle, so upgrading to a new version never erases accumulated diagnostic data.
+- **Explicit wipe required:** `uninstall.php` now checks for an `xapi_monitor_wipe_on_uninstall` flag before dropping any tables. The flag is only set when the admin uses the new "Delete All Data" action — never set automatically.
+- **Settings retained on delete:** `xapi_monitor_settings` (email recipients, thresholds, beacon toggle, etc.) is no longer removed by `uninstall.php` by default, preserving configuration across reinstalls.
+- **"Delete All Data" action added to Settings → Danger Zone:** Two-step confirmation UI (click → confirm → execute) for permanently erasing all logs, alerts, and settings when intentionally resetting the plugin. Tables are immediately re-created empty so the plugin resumes collection without requiring a full reinstall.
+- **Cron schedules remain the only thing always cleared on delete:** They are automatically re-registered on the next plugin activation.
+
 ## [1.0.2] - 2026-04-12
 
 ### Fixed
