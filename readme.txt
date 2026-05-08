@@ -4,7 +4,7 @@ Tags: xapi, learndash, tin-canny, lrs, elearning
 Requires at least: 6.0
 Tested up to: 6.9
 Requires PHP: 8.0
-Stable tag: 1.1.0
+Stable tag: 1.2.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -31,10 +31,14 @@ This plugin makes those invisible failures visible.
 
 * **5-Layer Statement Capture** — Hooks into Tin Canny's processing pipeline (before processing, after processing, capture filter, REST intercept) plus a JavaScript beacon that monitors client-side delivery
 * **Automated Diagnostic Engine** — Runs every 15 minutes to detect completion mismatches (Tin Canny has data but LearnDash doesn't), statement gaps (activity without completion), and endpoint health issues
+* **REST Log & Alerts API** — Authenticated endpoints for paginated log access (GET /xapi-monitor/v1/logs), single-row retrieval with raw statement JSON (GET /xapi-monitor/v1/logs/{id}), and alerts listing (GET /xapi-monitor/v1/alerts). Enables n8n workflows, external dashboards, and programmatic access.
+* **Quiz Step Detection** — Detects when a LearnDash course contains quiz steps that xAPI cannot complete, warns admin proactively with the specific quiz IDs.
+* **Evidence-Linked Diagnostics** — Every completion mismatch alert includes a structured evidence payload: Tin Canny DB rows, LearnDash activity records, and log IDs. All conclusions are traceable to raw data.
 * **Admin Dashboard** — Live statement feed, alerts with recommended actions, per-user diagnostics with side-by-side Tin Canny vs LearnDash comparison, system health checks
 * **Email Alerts** — Configurable notifications for critical issues (failed endpoints, high failure rates, stuck users)
 * **Fix Actions** — Force LearnDash completion, reset xAPI data, resend statements — all from the dashboard
 * **JavaScript Beacon** — Intercepts XHR/Fetch from Rise iframes to detect client-side delivery failures (timeouts, network errors, blocked requests) that server-side logging can't see
+* **"How xAPI Works" Tab** — In-plugin educational reference covering the full xAPI pipeline, ADL verb semantics table, six common failure patterns, and full APA 7 citations to peer-reviewed learning analytics literature
 * **Zero Impact** — Purely observational. Never blocks, modifies, or interferes with normal xAPI/Tin Canny/LearnDash processing
 
 = Requirements =
@@ -127,6 +131,17 @@ By default, 30 days. Configurable in Settings. You can also export to CSV before
 5. Settings — configure alerts, thresholds, and monitoring behavior
 
 == Changelog ==
+
+= 1.2.0 =
+* Added REST Log & Alerts API: GET /xapi-monitor/v1/logs (paginated, filterable by user, lesson, status, days), GET /xapi-monitor/v1/logs/{id} (single row with raw statement JSON), GET /xapi-monitor/v1/alerts (paginated with status filter)
+* Added Quiz Step Detection: diagnostic engine now identifies LearnDash quiz steps that xAPI cannot trigger; User Diagnostic tab shows a yellow warning with affected quiz IDs
+* Added Evidence-Linked Diagnostics: completion mismatch alerts now store a structured evidence payload (Tin Canny rows, LearnDash activity, log IDs) visible in a collapsible "View Evidence" section in the Alerts tab
+* Added "How xAPI Works" documentation tab: 7-section in-plugin reference covering the xAPI pipeline, ADL verb semantics, six common failure patterns, scholarly context grounded in peer-reviewed learning analytics literature (Vidal et al., 2018; Samuelsen et al., 2021; Nouira et al., 2018; Ahmad et al., 2022; Rocha et al., 2024; Friesen, 2013), and full APA 7 references
+* Fixed Tin Canny version detection: /status endpoint now correctly reads installed version via get_plugins() with multiple fallback strategies including direct plugin header read
+* Added memory limit warning: sites with WP memory below 64M receive a yellow notice in Settings and System Health tabs
+* Added evidence column to xapi_monitor_alerts table; existing installs upgraded automatically via maybe_upgrade()
+* Added Last Diagnostic Run timestamp to Alerts tab header
+* Added Data Sources panel to User Diagnostic tab linking each finding to source tables and row IDs
 
 = 1.1.0 =
 * Tested up to WordPress 6.9 (compatible with 6.9.4 security releases)
