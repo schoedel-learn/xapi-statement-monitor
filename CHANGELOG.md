@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-05-08
+
+### Added
+- **REST Log API** — New authenticated REST endpoints: GET /xapi-monitor/v1/logs (paginated), GET /xapi-monitor/v1/logs/{id} (single row with raw statement), GET /xapi-monitor/v1/alerts. Enables programmatic access to all monitoring data from external tools, n8n workflows, and dashboards.
+- **Quiz Step Detection** — Diagnostic engine now detects when a LearnDash course contains quiz steps that cannot be completed via xAPI statements. Warns admin proactively in the User Diagnostic tab with the specific quiz IDs involved.
+- **Evidence-Linked Diagnostics** — Every completion mismatch alert now includes a structured evidence payload: the Tin Canny DB rows that triggered the finding, matching LearnDash activity records, and xAPI Monitor log IDs. Evidence is displayed in a collapsible section in the Alerts tab.
+- **"How xAPI Works" Documentation Tab** — In-plugin educational reference covering the full xAPI pipeline, ADL verb semantics, common failure patterns with field explanations, and references to authoritative sources. Grounded in peer-reviewed learning analytics literature (Vidal et al., 2018; Samuelsen et al., 2021; Nouira et al., 2018; Ahmad et al., 2022; Rocha et al., 2024; Friesen, 2013) with full APA 7 citations. Designed for both technical and non-technical admins.
+- **Tin Canny Version Detection Fix** — Status endpoint now correctly detects and reports the installed Tin Canny version by reading the plugin file header directly, with multiple fallback strategies.
+- **Memory Limit Warning** — Sites with WordPress memory limit below 64M now receive a yellow notice in Settings and System Health tabs.
+
+### Changed
+- `evidence` column added to xapi_monitor_alerts table (existing installs upgraded automatically via maybe_upgrade)
+- User Diagnostic tab now shows quiz step warning and a Data Sources panel linking each finding to its source DB table and row IDs
+- Alerts tab now shows Last Diagnostic Run timestamp in header
+- Alerts tab evidence payload displayed in collapsible "View Evidence" section with raw DB rows
+
 ## [1.1.0] - 2026-07-01
 
 ### Changed

@@ -3,7 +3,7 @@
  * Plugin Name: xAPI Statement Monitor
  * Plugin URI:  https://github.com/barryschoedel/xapi-statement-monitor
  * Description: Diagnoses xAPI completion tracking failures on LearnDash + Tin Canny sites. Intercepts, logs, and analyzes every xAPI statement in the pipeline from Articulate Rise (and other xAPI content) through Tin Canny to LearnDash completion.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      Barry Schoedel
  * Author URI:  https://schoedel.design/
  * License:     GPL-2.0+
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONSTANTS
 // ============================================================
-define( 'XAPI_MONITOR_VERSION',    '1.1.0' );
+define( 'XAPI_MONITOR_VERSION',    '1.2.0' );
 define( 'XAPI_MONITOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'XAPI_MONITOR_PLUGIN_FILE', __FILE__ );
@@ -178,6 +178,7 @@ class XAPI_Monitor {
             resolved_by      bigint(20)   NOT NULL DEFAULT 0,
             resolved_at      datetime     DEFAULT NULL,
             resolution_notes text         NOT NULL DEFAULT '',
+            evidence         longtext     NOT NULL DEFAULT '',
             PRIMARY KEY  (id),
             KEY idx_timestamp  (timestamp),
             KEY idx_type       (alert_type),
@@ -274,7 +275,35 @@ class XAPI_Monitor {
         if ( version_compare( $installed, XAPI_MONITOR_VERSION, '<' ) ) {
             self::create_tables();
             self::schedule_crons(); // Re-schedule in case activation didn't register them
+            // v1.2.0: add evidence column to alerts table for existing installs
+            if ( version_compare( $installed, '1.2.0', '<' ) ) {
+                $this->maybe_add_evidence_column();
+            }
             update_option( 'xapi_monitor_version', XAPI_MONITOR_VERSION );
+        }
+    }
+
+    /**
+     * Add the evidence column to the alerts table if it doesn't exist.
+     * Uses ALTER TABLE ... ADD COLUMN pattern safe for repeated execution.
+     */
+    private function maybe_add_evidence_column(): void {
+        $col_exists = $this->db->get_var(
+            $this->db->prepare(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = %s
+                   AND TABLE_NAME   = %s
+                   AND COLUMN_NAME  = 'evidence'",
+                DB_NAME,
+                $this->alerts_table
+            )
+        );
+        if ( ! $col_exists ) {
+            // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            $this->db->query(
+                "ALTER TABLE `{$this->alerts_table}` ADD COLUMN `evidence` longtext NOT NULL DEFAULT ''"
+            );
+            // phpcs:enable
         }
     }
 
@@ -1046,6 +1075,41 @@ class XAPI_Monitor {
             'callback'            => [ $this, 'rest_run_diagnostics' ],
             'permission_callback' => [ $this, 'rest_admin_only' ],
         ] );
+
+        // v1.2.0: Log & Alerts REST API
+        register_rest_route( 'xapi-monitor/v1', '/logs', [
+            'methods'             => 'GET',
+            'callback'            => [ $this, 'rest_get_logs' ],
+            'permission_callback' => [ $this, 'rest_admin_only' ],
+            'args'                => [
+                'per_page'  => [ 'default' => 50,  'sanitize_callback' => 'absint' ],
+                'page'      => [ 'default' => 1,   'sanitize_callback' => 'absint' ],
+                'user_id'   => [ 'default' => 0,   'sanitize_callback' => 'absint' ],
+                'lesson_id' => [ 'default' => 0,   'sanitize_callback' => 'absint' ],
+                'status'    => [ 'default' => '',   'sanitize_callback' => 'sanitize_text_field' ],
+                'days'      => [ 'default' => 30,  'sanitize_callback' => 'absint' ],
+            ],
+        ] );
+
+        register_rest_route( 'xapi-monitor/v1', '/logs/(?P<id>\d+)', [
+            'methods'             => 'GET',
+            'callback'            => [ $this, 'rest_get_log_single' ],
+            'permission_callback' => [ $this, 'rest_admin_only' ],
+            'args'                => [
+                'id' => [ 'validate_callback' => 'is_numeric' ],
+            ],
+        ] );
+
+        register_rest_route( 'xapi-monitor/v1', '/alerts', [
+            'methods'             => 'GET',
+            'callback'            => [ $this, 'rest_get_alerts' ],
+            'permission_callback' => [ $this, 'rest_admin_only' ],
+            'args'                => [
+                'status'   => [ 'default' => 'open', 'sanitize_callback' => 'sanitize_text_field' ],
+                'per_page' => [ 'default' => 50,     'sanitize_callback' => 'absint' ],
+                'page'     => [ 'default' => 1,      'sanitize_callback' => 'absint' ],
+            ],
+        ] );
     }
 
     public function rest_admin_only(): bool {
@@ -1171,6 +1235,114 @@ class XAPI_Monitor {
         return new WP_REST_Response( [ 'ok' => true, 'alerts_generated' => $result ], 200 );
     }
 
+    /** GET /logs — paginated read access to xapi_monitor_log */
+    public function rest_get_logs( WP_REST_Request $request ): WP_REST_Response {
+        $per_page  = min( (int) $request->get_param( 'per_page' ), 200 );
+        $page      = max( 1, (int) $request->get_param( 'page' ) );
+        $user_id   = (int) $request->get_param( 'user_id' );
+        $lesson_id = (int) $request->get_param( 'lesson_id' );
+        $status    = sanitize_text_field( $request->get_param( 'status' ) );
+        $days      = max( 1, (int) $request->get_param( 'days' ) );
+        $offset    = ( $page - 1 ) * $per_page;
+
+        $where  = ' WHERE timestamp > DATE_SUB(NOW(), INTERVAL %d DAY)';
+        $params = [ $days ];
+
+        if ( $user_id ) {
+            $where    .= ' AND user_id = %d';
+            $params[]  = $user_id;
+        }
+        if ( $lesson_id ) {
+            $where    .= ' AND lesson_id = %d';
+            $params[]  = $lesson_id;
+        }
+        if ( $status && in_array( $status, [ 'delivered', 'failed', 'timeout', 'captured', 'processed', 'blocked' ], true ) ) {
+            $where    .= ' AND delivery_status = %s';
+            $params[]  = $status;
+        }
+
+        $count_sql = "SELECT COUNT(*) FROM {$this->log_table}{$where}";
+        $total     = (int) $this->db->get_var( $this->db->prepare( $count_sql, $params ) );
+        $pages     = $total > 0 ? (int) ceil( $total / $per_page ) : 1;
+
+        $data_params   = array_merge( $params, [ $per_page, $offset ] );
+        $data_sql      = "SELECT id, user_id, user_email, user_display_name, lesson_id, lesson_title, course_id, course_title, verb, verb_display, activity_id, activity_name, result_success, result_completion, result_score_raw, result_score_scaled, source, delivery_status, failure_reason, endpoint_response_code, session_id, timestamp, created_at FROM {$this->log_table}{$where} ORDER BY timestamp DESC LIMIT %d OFFSET %d";
+        $logs          = $this->db->get_results( $this->db->prepare( $data_sql, $data_params ) );
+
+        return new WP_REST_Response( [
+            'total' => $total,
+            'pages' => $pages,
+            'logs'  => $logs ?: [],
+        ], 200 );
+    }
+
+    /** GET /logs/{id} — single log row by ID with full raw_statement JSON */
+    public function rest_get_log_single( WP_REST_Request $request ): WP_REST_Response {
+        $id  = (int) $request->get_param( 'id' );
+        $row = $this->db->get_row(
+            $this->db->prepare(
+                "SELECT * FROM {$this->log_table} WHERE id = %d",
+                $id
+            )
+        );
+        if ( ! $row ) {
+            return new WP_REST_Response( [ 'error' => 'Log entry not found' ], 404 );
+        }
+        // Decode raw_statement for clean JSON output
+        if ( $row->raw_statement ) {
+            $decoded = json_decode( $row->raw_statement, true );
+            if ( $decoded ) {
+                $row->raw_statement = $decoded;
+            }
+        }
+        return new WP_REST_Response( $row, 200 );
+    }
+
+    /** GET /alerts — read access to xapi_monitor_alerts */
+    public function rest_get_alerts( WP_REST_Request $request ): WP_REST_Response {
+        $status   = sanitize_text_field( $request->get_param( 'status' ) );
+        $per_page = min( (int) $request->get_param( 'per_page' ), 200 );
+        $page     = max( 1, (int) $request->get_param( 'page' ) );
+        $offset   = ( $page - 1 ) * $per_page;
+
+        $where  = ' WHERE 1=1';
+        $params = [];
+        if ( 'open' === $status ) {
+            $where .= ' AND resolved = 0';
+        } elseif ( 'resolved' === $status ) {
+            $where .= ' AND resolved = 1';
+        }
+
+        $count_sql = "SELECT COUNT(*) FROM {$this->alerts_table}{$where}";
+        $total     = ! empty( $params )
+            ? (int) $this->db->get_var( $this->db->prepare( $count_sql, $params ) )
+            : (int) $this->db->get_var( $count_sql );
+        $pages     = $total > 0 ? (int) ceil( $total / $per_page ) : 1;
+
+        $data_sql = "SELECT id, alert_type, severity, user_id, course_id, lesson_id, message, diagnostic_data, resolved, resolved_by, resolved_at, resolution_notes, timestamp, evidence FROM {$this->alerts_table}{$where} ORDER BY timestamp DESC LIMIT %d OFFSET %d";
+        $all_params = array_merge( $params, [ $per_page, $offset ] );
+        $alerts   = $this->db->get_results( $this->db->prepare( $data_sql, $all_params ) );
+
+        // Decode evidence JSON for cleaner output
+        if ( $alerts ) {
+            foreach ( $alerts as &$alert ) {
+                if ( ! empty( $alert->evidence ) ) {
+                    $decoded = json_decode( $alert->evidence, true );
+                    if ( $decoded ) {
+                        $alert->evidence = $decoded;
+                    }
+                }
+            }
+            unset( $alert );
+        }
+
+        return new WP_REST_Response( [
+            'total'  => $total,
+            'pages'  => $pages,
+            'alerts' => $alerts ?: [],
+        ], 200 );
+    }
+
     // ============================================================
     // SECTION 5: DIAGNOSTIC COMPARISON ENGINE (CRON)
     // ============================================================
@@ -1237,6 +1409,8 @@ class XAPI_Monitor {
             if ( ( $has_completed || $has_passed ) && ! $ld_complete ) {
                 $existing = $this->get_open_alert( $uid, $lid, 'missing_completion' );
                 if ( ! $existing ) {
+                    // Build evidence payload
+                    $evidence = $this->build_completion_evidence( $uid, $lid, $cid );
                     $alerts_generated += $this->create_alert( [
                         'alert_type'     => 'missing_completion',
                         'severity'       => 'critical',
@@ -1254,6 +1428,7 @@ class XAPI_Monitor {
                             'ld_complete'     => $ld_complete,
                             'statements_count'=> count( $statements ),
                         ] ),
+                        'evidence' => wp_json_encode( $evidence ),
                     ] ) ? 1 : 0;
                 }
             }
@@ -1356,6 +1531,222 @@ class XAPI_Monitor {
             }
         }
         return 0;
+    }
+
+    // ============================================================
+    // SECTION 5b: QUIZ STEP DETECTION & EVIDENCE BUILDING (v1.2.0)
+    // ============================================================
+
+    /**
+     * Build a structured evidence payload for a completion mismatch alert.
+     * Collects Tin Canny rows, LearnDash activity, and monitor log IDs.
+     *
+     * Memory-conscious: limits row counts and uses SELECT with only needed columns.
+     */
+    private function build_completion_evidence( int $user_id, int $lesson_id, int $course_id ): array {
+        $evidence = [
+            'tin_canny_rows'     => [],
+            'learndash_activity' => null,
+            'log_ids'            => [],
+        ];
+
+        // Fetch matching Tin Canny rows (uotincan_reporting table)
+        $tc_table = $this->db->prefix . 'uotincan_reporting';
+        $tc_exists = (bool) $this->db->get_var( $this->db->prepare( 'SHOW TABLES LIKE %s', $tc_table ) );
+        if ( $tc_exists ) {
+            $tc_rows = $this->db->get_results(
+                $this->db->prepare(
+                    "SELECT user_id, lesson_id, course_id, verb, completion, passed, created_at
+                     FROM {$tc_table}
+                     WHERE user_id = %d AND lesson_id = %d
+                     ORDER BY created_at DESC LIMIT 10",
+                    $user_id,
+                    $lesson_id
+                )
+            );
+            if ( $tc_rows ) {
+                $evidence['tin_canny_rows'] = array_map( fn( $r ) => (array) $r, $tc_rows );
+            }
+        }
+
+        // Fetch LearnDash user activity
+        if ( function_exists( 'learndash_get_user_activity' ) && $lesson_id ) {
+            $ld_activity = learndash_get_user_activity( [
+                'user_id'       => $user_id,
+                'post_id'       => $lesson_id,
+                'course_id'     => $course_id,
+                'activity_type' => 'lesson',
+            ] );
+            if ( $ld_activity ) {
+                $evidence['learndash_activity'] = (array) $ld_activity;
+            }
+        }
+
+        // Get monitor log IDs supporting this finding
+        $log_rows = $this->db->get_results(
+            $this->db->prepare(
+                "SELECT id FROM {$this->log_table}
+                 WHERE user_id = %d AND lesson_id = %d
+                   AND verb IN ('completed','passed')
+                 ORDER BY timestamp DESC LIMIT 20",
+                $user_id,
+                $lesson_id
+            )
+        );
+        if ( $log_rows ) {
+            $evidence['log_ids'] = array_map( fn( $r ) => (int) $r->id, $log_rows );
+        }
+
+        return $evidence;
+    }
+
+    /**
+     * Detect quiz steps belonging to a course.
+     * Returns array of [ 'quiz_id' => int, 'title' => string, 'lesson_id' => int ].
+     */
+    private function detect_quiz_steps( int $course_id ): array {
+        if ( ! $course_id ) {
+            return [];
+        }
+        $quizzes = get_posts( [
+            'post_type'      => 'sfwd-quiz',
+            'posts_per_page' => 50,
+            'fields'         => 'ids',
+            'meta_query'     => [
+                [
+                    'key'     => 'course_id',
+                    'value'   => $course_id,
+                    'compare' => '=',
+                    'type'    => 'NUMERIC',
+                ],
+            ],
+        ] );
+
+        $result = [];
+        foreach ( $quizzes as $quiz_id ) {
+            $lesson_id = (int) get_post_meta( $quiz_id, 'lesson_id', true );
+            $result[]  = [
+                'quiz_id'   => (int) $quiz_id,
+                'title'     => get_the_title( $quiz_id ) ?: 'Quiz #' . $quiz_id,
+                'lesson_id' => $lesson_id,
+            ];
+        }
+        return $result;
+    }
+
+    /**
+     * Check whether any incomplete steps in a course are quizzes that xAPI cannot trigger.
+     *
+     * @return array { has_warning: bool, message: string, quiz_steps: array }
+     */
+    private function check_quiz_step_mismatch( int $user_id, int $course_id ): array {
+        $no_warning = [ 'has_warning' => false ];
+
+        if ( ! $user_id || ! $course_id ) {
+            return $no_warning;
+        }
+
+        if ( ! function_exists( 'learndash_user_get_course_progress' ) ) {
+            return $no_warning;
+        }
+
+        $progress   = learndash_user_get_course_progress( $user_id, $course_id );
+        $quiz_steps = $this->detect_quiz_steps( $course_id );
+
+        if ( empty( $quiz_steps ) ) {
+            return $no_warning;
+        }
+
+        // Determine which quiz steps are not yet complete for this user
+        $incomplete_quiz_steps = [];
+        foreach ( $quiz_steps as $quiz ) {
+            $is_complete = false;
+            // Check LearnDash quiz completion via user meta
+            if ( function_exists( 'learndash_is_quiz_complete' ) ) {
+                $is_complete = (bool) learndash_is_quiz_complete( $user_id, $quiz['quiz_id'], $course_id );
+            } else {
+                // Fallback: check usermeta
+                $quiz_data = get_user_meta( $user_id, '_sfwd-quizzes', true );
+                if ( is_array( $quiz_data ) ) {
+                    foreach ( $quiz_data as $entry ) {
+                        if ( isset( $entry['quiz'] ) && (int) $entry['quiz'] === $quiz['quiz_id'] ) {
+                            $is_complete = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ( ! $is_complete ) {
+                $incomplete_quiz_steps[] = $quiz;
+            }
+        }
+
+        if ( empty( $incomplete_quiz_steps ) ) {
+            return $no_warning;
+        }
+
+        $count = count( $incomplete_quiz_steps );
+        return [
+            'has_warning' => true,
+            'message'     => sprintf(
+                'This course contains %d quiz step(s) that cannot be completed via xAPI statements. Quizzes must be completed directly in LearnDash.',
+                $count
+            ),
+            'quiz_steps'  => $incomplete_quiz_steps,
+        ];
+    }
+
+    /**
+     * Detect the installed Tin Canny version through multiple fallback strategies.
+     */
+    private function get_tincanny_version(): string {
+        // 1. Try get_plugins() — most reliable but requires include
+        if ( ! function_exists( 'get_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        $all_plugins = get_plugins();
+        $tc_slugs    = [
+            'tin-canny-learndash-reporting/tin-canny-learndash-reporting.php',
+            'uncanny-learndash-reporting/uncanny-learndash-reporting.php',
+            'developer-tin-canny-learndash-reporting/developer-tin-canny-learndash-reporting.php',
+        ];
+        foreach ( $tc_slugs as $slug ) {
+            if ( isset( $all_plugins[ $slug ]['Version'] ) ) {
+                return $all_plugins[ $slug ]['Version'];
+            }
+        }
+
+        // 2. Try class constant or static property
+        foreach ( [ 'UO_Tin_Can', 'UNCANNY_REPORTING', '\\uncanny_learndash_reporting\\Config' ] as $cls ) {
+            if ( class_exists( $cls ) ) {
+                if ( defined( $cls . '::VERSION' ) ) {
+                    return constant( $cls . '::VERSION' );
+                }
+                if ( defined( $cls . '::PLUGIN_VERSION' ) ) {
+                    return constant( $cls . '::PLUGIN_VERSION' );
+                }
+            }
+        }
+
+        // 3. Try option values
+        foreach ( [ 'tcrld_version', 'uncanny_reporting_version', 'uo_reporting_version' ] as $opt ) {
+            $val = get_option( $opt );
+            if ( $val && is_string( $val ) ) {
+                return $val;
+            }
+        }
+
+        // 4. Read the plugin file header directly
+        $plugin_file = WP_PLUGIN_DIR . '/tin-canny-learndash-reporting/tin-canny-learndash-reporting.php';
+        if ( file_exists( $plugin_file ) ) {
+            if ( ! function_exists( 'get_plugin_data' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            }
+            $plugin_data = get_plugin_data( $plugin_file, false, false );
+            return $plugin_data['Version'] ?? 'Unknown';
+        }
+
+        return 'Not detected';
     }
 
     /**
@@ -1601,8 +1992,9 @@ class XAPI_Monitor {
                 'resolved'        => 0,
                 'resolved_by'     => 0,
                 'resolution_notes'=> '',
+                'evidence'        => $data['evidence'] ?? '',
             ],
-            [ '%s','%s','%s','%d','%d','%d','%s','%s','%d','%d','%s' ]
+            [ '%s','%s','%s','%d','%d','%d','%s','%s','%d','%d','%s','%s' ]
         );
         return (bool) $result;
     }
@@ -2099,6 +2491,7 @@ class XAPI_Monitor {
             'user-diagnostic' => __( 'User Diagnostic', 'xapi-monitor' ),
             'system-health'   => __( 'System Health', 'xapi-monitor' ),
             'settings'        => __( 'Settings', 'xapi-monitor' ),
+            'xapi-docs'       => __( 'How xAPI Works', 'xapi-monitor' ),
         ];
 
         $nonce = wp_create_nonce( 'xapi_monitor_admin' );
@@ -2137,6 +2530,9 @@ class XAPI_Monitor {
                         break;
                     case 'settings':
                         $this->render_tab_settings( $nonce );
+                        break;
+                    case 'xapi-docs':
+                        $this->render_tab_xapi_docs( $nonce );
                         break;
                 }
                 ?>
@@ -2300,6 +2696,17 @@ class XAPI_Monitor {
 .xapi-comparison-missing { color:#784212; }
 table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; }
 .xapi-section-header { font-size:16px; font-weight:600; margin:20px 0 10px; padding-bottom:8px; border-bottom:2px solid #eee; }
+.xapi-docs-section { margin-bottom:24px; }
+.xapi-docs-section h2 { font-size:18px; font-weight:700; margin-bottom:8px; }
+.xapi-docs-section h3 { font-size:15px; font-weight:700; margin:16px 0 6px; }
+.xapi-docs-section table.xapi-verb-table { border-collapse:collapse; width:100%; margin:12px 0; }
+.xapi-docs-section table.xapi-verb-table th,.xapi-docs-section table.xapi-verb-table td { border:1px solid #ddd; padding:8px 10px; font-size:13px; }
+.xapi-docs-section table.xapi-verb-table th { background:#f1f3f5; font-weight:600; }
+.xapi-docs-section .xapi-pipeline-steps { list-style:none; padding:0; margin:12px 0; }
+.xapi-docs-section .xapi-pipeline-steps li { display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; }
+.xapi-docs-section .xapi-pipeline-steps li .step-num { background:#3498db; color:#fff; border-radius:50%; width:24px; height:24px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0; }
+.xapi-reference { font-size:85%; padding-left:2em; text-indent:-2em; margin:8px 0; line-height:1.5; }
+.xapi-scholarly-note { background:#fff8e1; border-left:4px solid #ffc107; padding:10px 14px; margin:12px 0; font-size:13px; }
 </style>
         <?php
     }
@@ -2581,13 +2988,20 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
         $alert_types = [ 'missing_completion','endpoint_failure','statement_gap','high_failure_rate','user_stuck' ];
         $severities  = [ 'critical','warning','info' ];
 
-        $open_count = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->alerts_table} WHERE resolved = 0 AND severity = 'critical'" );
+        $open_count    = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->alerts_table} WHERE resolved = 0 AND severity = 'critical'" );
+        $last_diag_run = get_option( 'xapi_monitor_last_diagnostic', null );
         ?>
         <h2><?php esc_html_e( 'Alerts & Diagnostics', 'xapi-monitor' ); ?>
             <?php if ( $open_count ) : ?>
                 <span style="background:#e74c3c;color:#fff;padding:3px 10px;border-radius:10px;font-size:13px;margin-left:10px"><?php echo $open_count; ?> <?php esc_html_e( 'open critical', 'xapi-monitor' ); ?></span>
             <?php endif; ?>
         </h2>
+        <?php if ( $last_diag_run ) : ?>
+            <p style="color:#666;font-size:12px;margin-top:-4px">
+                <?php esc_html_e( 'Last diagnostic run:', 'xapi-monitor' ); ?>
+                <strong><?php echo esc_html( $last_diag_run ); ?></strong>
+            </p>
+        <?php endif; ?>
 
         <div class="xapi-actions-bar">
             <button class="button button-primary" id="xapi-run-diagnostic"><?php esc_html_e( 'Run Diagnostic Now', 'xapi-monitor' ); ?></button>
@@ -2660,6 +3074,30 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
                                 <details style="margin-top:6px">
                                     <summary style="cursor:pointer;font-size:12px;color:#3498db"><?php esc_html_e( 'Diagnostic Data', 'xapi-monitor' ); ?></summary>
                                     <pre style="font-size:11px;background:#f8f9fa;padding:8px;margin-top:4px"><?php echo esc_html( wp_json_encode( $diag, JSON_PRETTY_PRINT ) ); ?></pre>
+                                </details>
+                            <?php endif; ?>
+                            <?php
+                            // Evidence panel (v1.2.0)
+                            $evidence_raw  = $alert->evidence ?? '';
+                            $evidence_data = $evidence_raw ? json_decode( $evidence_raw, true ) : null;
+                            if ( $evidence_data ) :
+                            ?>
+                                <details style="margin-top:6px">
+                                    <summary style="cursor:pointer;font-size:12px;color:#8e44ad;font-weight:600"><?php esc_html_e( 'View Evidence', 'xapi-monitor' ); ?></summary>
+                                    <div style="background:#fdf9ff;border:1px solid #d7bde2;border-radius:4px;padding:10px;margin-top:4px;font-size:12px">
+                                        <?php if ( ! empty( $evidence_data['tin_canny_rows'] ) ) : ?>
+                                            <p style="margin:0 0 4px"><strong><?php esc_html_e( 'Tin Canny DB rows (wpv5_uotincan_reporting):', 'xapi-monitor' ); ?></strong></p>
+                                            <pre style="font-size:10px;background:#1e1e1e;color:#d4d4d4;padding:8px;border-radius:3px;overflow-x:auto;max-height:150px"><?php echo esc_html( wp_json_encode( $evidence_data['tin_canny_rows'], JSON_PRETTY_PRINT ) ); ?></pre>
+                                        <?php endif; ?>
+                                        <?php if ( ! empty( $evidence_data['learndash_activity'] ) ) : ?>
+                                            <p style="margin:6px 0 4px"><strong><?php esc_html_e( 'LearnDash activity record:', 'xapi-monitor' ); ?></strong></p>
+                                            <pre style="font-size:10px;background:#1e1e1e;color:#d4d4d4;padding:8px;border-radius:3px;overflow-x:auto;max-height:120px"><?php echo esc_html( wp_json_encode( $evidence_data['learndash_activity'], JSON_PRETTY_PRINT ) ); ?></pre>
+                                        <?php endif; ?>
+                                        <?php if ( ! empty( $evidence_data['log_ids'] ) ) : ?>
+                                            <p style="margin:6px 0 2px"><strong><?php esc_html_e( 'xAPI Monitor log IDs:', 'xapi-monitor' ); ?></strong>
+                                            <?php echo esc_html( implode( ', ', array_map( 'intval', $evidence_data['log_ids'] ) ) ); ?></p>
+                                        <?php endif; ?>
+                                    </div>
                                 </details>
                             <?php endif; ?>
                             <details style="margin-top:6px">
@@ -2773,6 +3211,24 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
                     </button>
                 </div>
 
+                <?php
+                // Quiz step warning (v1.2.0)
+                $qsw = $data['quiz_step_warning'] ?? [ 'has_warning' => false ];
+                if ( ! empty( $qsw['has_warning'] ) ) :
+                ?>
+                    <div class="notice notice-warning inline" style="margin:12px 0;padding:10px 14px;">
+                        <p><strong><?php esc_html_e( 'Quiz Step Warning', 'xapi-monitor' ); ?></strong><br>
+                        <?php echo esc_html( $qsw['message'] ?? '' ); ?></p>
+                        <?php if ( ! empty( $qsw['quiz_steps'] ) ) : ?>
+                            <ul style="margin:8px 0 0 20px;font-size:13px">
+                            <?php foreach ( $qsw['quiz_steps'] as $qs ) : ?>
+                                <li><strong><?php echo esc_html( $qs['title'] ); ?></strong> (Quiz ID: <?php echo (int) $qs['quiz_id']; ?><?php echo $qs['lesson_id'] ? ', Lesson ID: ' . (int) $qs['lesson_id'] : ''; ?>)</li>
+                            <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
                 <?php if ( ! empty( $data['courses'] ) ) : ?>
                     <?php foreach ( $data['courses'] as $course_data ) : ?>
                         <h4 style="background:#f1f3f5;padding:10px;border-left:4px solid #3498db;margin-top:20px">
@@ -2843,6 +3299,24 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
                             </tbody>
                         </table>
 
+                        <?php // Data Sources panel (v1.2.0) ?>
+                        <details style="margin:10px 0">
+                            <summary style="cursor:pointer;font-size:12px;color:#666;font-weight:600"><?php esc_html_e( 'Data Sources for This Course', 'xapi-monitor' ); ?></summary>
+                            <div style="background:#f8f9fa;border:1px solid #ddd;border-radius:4px;padding:10px;margin-top:4px;font-size:12px">
+                                <p style="margin:0 0 4px"><strong><?php esc_html_e( 'xAPI Monitor Log Table:', 'xapi-monitor' ); ?></strong> <code><?php echo esc_html( $this->log_table ); ?></code>
+                                — <?php echo esc_html( count( $course_data['statement_timeline'] ?? [] ) ); ?> <?php esc_html_e( 'rows for this course', 'xapi-monitor' ); ?></p>
+                                <p style="margin:4px 0"><strong><?php esc_html_e( 'Tin Canny Reporting Table:', 'xapi-monitor' ); ?></strong> <code><?php echo esc_html( $this->db->prefix . 'uotincan_reporting' ); ?></code>
+                                — <?php esc_html_e( 'queried live for completion/passed rows per lesson', 'xapi-monitor' ); ?></p>
+                                <p style="margin:4px 0"><strong><?php esc_html_e( 'LearnDash:', 'xapi-monitor' ); ?></strong> <?php esc_html_e( 'learndash_is_lesson_complete() called per lesson row above', 'xapi-monitor' ); ?></p>
+                                <?php if ( ! empty( $course_data['statement_timeline'] ) ) :
+                                    $log_ids = array_map( fn( $s ) => (int) $s->id, $course_data['statement_timeline'] );
+                                    sort( $log_ids );
+                                ?>
+                                <p style="margin:4px 0"><strong><?php esc_html_e( 'Log row IDs:', 'xapi-monitor' ); ?></strong> <?php echo esc_html( implode( ', ', array_slice( $log_ids, 0, 20 ) ) ); ?><?php echo count( $log_ids ) > 20 ? ' …' : ''; ?></p>
+                                <?php endif; ?>
+                            </div>
+                        </details>
+
                         <?php // Statement timeline for this course ?>
                         <?php if ( ! empty( $course_data['statement_timeline'] ) ) : ?>
                             <p class="xapi-section-header"><?php esc_html_e( 'Statement Timeline', 'xapi-monitor' ); ?></p>
@@ -2886,7 +3360,7 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
      * Build diagnostic data for a user.
      */
     private function get_user_diagnostic_data( int $user_id ): array {
-        $result = [ 'user_id' => $user_id, 'courses' => [] ];
+        $result = [ 'user_id' => $user_id, 'courses' => [], 'quiz_step_warning' => [ 'has_warning' => false ] ];
 
         // Get all statements for this user
         $statements = $this->db->get_results(
@@ -2945,22 +3419,35 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
         }
 
         // Check LearnDash completion for each lesson
+        // Track the first course with quiz step warning
+        $combined_quiz_warning = [ 'has_warning' => false ];
+        $userdata = get_userdata( $user_id );
+
         foreach ( $by_course as &$cd ) {
             foreach ( $cd['lessons'] as &$ld_data ) {
-                if ( function_exists( 'learndash_is_lesson_complete' ) ) {
+                if ( function_exists( 'learndash_is_lesson_complete' ) && $userdata ) {
                     $ld_data['ld_complete'] = (bool) learndash_is_lesson_complete(
-                        get_userdata( $user_id ),
+                        $userdata,
                         $ld_data['lesson_id']
                     );
                 }
             }
             unset( $ld_data );
-            // Sort verbs by most recent first
+            // Sort lessons alphabetically by title
             usort( $cd['lessons'], fn( $a, $b ) => strcmp( $a['lesson_title'], $b['lesson_title'] ) );
+
+            // Check quiz step mismatch for this course
+            if ( $cd['course_id'] && ! $combined_quiz_warning['has_warning'] ) {
+                $quiz_check = $this->check_quiz_step_mismatch( $user_id, $cd['course_id'] );
+                if ( $quiz_check['has_warning'] ) {
+                    $combined_quiz_warning = $quiz_check;
+                }
+            }
         }
         unset( $cd );
 
-        $result['courses'] = array_values( $by_course );
+        $result['courses']           = array_values( $by_course );
+        $result['quiz_step_warning'] = $combined_quiz_warning;
         return $result;
     }
 
@@ -2972,6 +3459,7 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
         $last_health_check = get_option( 'xapi_monitor_last_health_check', [] );
         ?>
         <h2><?php esc_html_e( 'System Health', 'xapi-monitor' ); ?></h2>
+        <?php $this->maybe_render_memory_warning(); ?>
 
         <div class="xapi-actions-bar">
             <button class="button button-primary" id="xapi-test-endpoint"><?php esc_html_e( 'Test Endpoint Now', 'xapi-monitor' ); ?></button>
@@ -3252,7 +3740,7 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
             'PHP Version'           => PHP_VERSION,
             'xAPI Monitor Version'  => XAPI_MONITOR_VERSION,
             'LearnDash Version'     => defined( 'LEARNDASH_VERSION' ) ? LEARNDASH_VERSION : 'Not detected',
-            'Tin Canny Version'     => defined( 'UO_REPORTING_VERSION' ) ? UO_REPORTING_VERSION : 'Not detected',
+            'Tin Canny Version'     => $this->get_tincanny_version(),
             'WordPress Memory Limit'=> WP_MEMORY_LIMIT,
             'PHP Memory Limit'      => ini_get( 'memory_limit' ),
             'Max Execution Time'    => ini_get( 'max_execution_time' ) . 's',
@@ -3305,6 +3793,35 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
     }
 
     // ============================================================
+    // MEMORY WARNING HELPER (v1.2.0)
+    // ============================================================
+
+    /**
+     * Render a yellow admin notice if WP memory limit is below 64M.
+     */
+    private function maybe_render_memory_warning(): void {
+        $wp_mem_bytes = wp_convert_hr_to_bytes( WP_MEMORY_LIMIT );
+        if ( $wp_mem_bytes < 64 * MB_IN_BYTES ) {
+            $mem_display = WP_MEMORY_LIMIT;
+            ?>
+            <div class="notice notice-warning inline" style="margin:12px 0;padding:10px 14px;">
+                <p><strong><?php esc_html_e( 'Memory Limit Notice', 'xapi-monitor' ); ?></strong><br>
+                <?php
+                printf(
+                    /* translators: %s: current WP memory limit value */
+                    esc_html__(
+                        'WordPress memory limit is set to %sM. The xAPI Monitor recommends at least 64M for reliable operation. Contact your host to increase wp-memory-limit in wp-config.php.',
+                        'xapi-monitor'
+                    ),
+                    esc_html( rtrim( $mem_display, 'Mm' ) )
+                );
+                ?></p>
+            </div>
+            <?php
+        }
+    }
+
+    // ============================================================
     // TAB 5: SETTINGS
     // ============================================================
     public function register_settings(): void {
@@ -3334,6 +3851,7 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
         $settings = get_option( 'xapi_monitor_settings', self::default_settings() );
         ?>
         <h2><?php esc_html_e( 'Settings', 'xapi-monitor' ); ?></h2>
+        <?php $this->maybe_render_memory_warning(); ?>
 
         <form method="post" action="options.php">
             <?php settings_fields( 'xapi_monitor_settings_group' ); ?>
@@ -3496,6 +4014,320 @@ table.wp-list-table td.column-raw-json { font-family:monospace; font-size:11px; 
         })();
         </script>
         <?php
+    }
+
+    // ============================================================
+    // TAB 6: HOW xAPI WORKS (v1.2.0)
+    // ============================================================
+
+    /**
+     * Render the "How xAPI Works" educational reference tab.
+     * Includes scholarly context with APA 7 citations.
+     */
+    private function render_tab_xapi_docs( string $nonce ): void {
+        ?>
+        <div style="max-width:900px">
+
+        <h2><?php esc_html_e( 'How xAPI Works', 'xapi-monitor' ); ?></h2>
+        <p class="description" style="font-size:14px;margin-bottom:20px">
+            <?php esc_html_e( 'An in-plugin reference guide covering the full xAPI pipeline on this site, ADL verb semantics, common failure patterns, and the scholarly context behind why this tooling is necessary.', 'xapi-monitor' ); ?>
+        </p>
+
+        <?php /* ===== SECTION 0: SCHOLARLY CONTEXT ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 0: xAPI and Learning Analytics — Scholarly Context', 'xapi-monitor' ); ?></h2>
+
+            <p><?php esc_html_e( 'Learning analytics is defined as "the measurement, collection, analysis and reporting of data about learners and their contexts, for purposes of understanding and optimising learning and the environments in which it occurs" (Siemens &amp; Long, 2011, as cited in Friesen, 2013). xAPI (Experience API) sits at the data-collection layer of that definition — it is the specification that makes learning events machine-readable and portable.', 'xapi-monitor' ); ?></p>
+
+            <p><?php esc_html_e( 'xAPI was developed by Advanced Distributed Learning (ADL) as the successor to SCORM. Where SCORM was limited to tracking learning inside a single LMS, xAPI was designed to capture learning activity from any context — mobile apps, simulations, informal practice, physical environments — and route those records to a Learning Record Store (LRS). On this site, Tin Canny acts as the LRS, receiving xAPI statements from Articulate Rise content and translating them into LearnDash completion events.', 'xapi-monitor' ); ?></p>
+
+            <div class="xapi-scholarly-note">
+                <p style="margin:0"><strong><?php esc_html_e( 'Why formal tooling is necessary:', 'xapi-monitor' ); ?></strong>
+                <?php esc_html_e( 'Vidal et al. (2018) found that "the xAPI specification is informal, with some loose definitions, that may lead to unexpected mistakes." Their ontological analysis demonstrated that different authoring tools and LRS platforms can interpret the same verb differently — and those differences produce silent failures that are invisible without a monitoring layer. This plugin provides that layer.', 'xapi-monitor' ); ?></p>
+            </div>
+
+            <p><?php esc_html_e( 'At the practitioner level, Samuelsen et al. (2021) found in a real-world case study that "standards are seldom used for integration of multiple sources in LA" and identified "challenges and limitations in describing learning context data." The gap between what xAPI promises and what production deployments actually achieve is well-documented. This plugin directly addresses that gap by making every step in the pipeline inspectable.', 'xapi-monitor' ); ?></p>
+
+            <p><?php esc_html_e( 'More recently, Rocha et al. (2024) documented "bottlenecks" in real-world xAPI/LRS implementations even when specifications are correctly followed — finding that routing statements through intermediary systems (such as Tin Canny sitting between Rise and LearnDash) introduces latency, deduplication decisions, and schema assumptions that can silently drop or misinterpret records.', 'xapi-monitor' ); ?></p>
+        </div>
+
+        <?php /* ===== SECTION 1: THE PIPELINE ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 1: The xAPI Pipeline on This Site', 'xapi-monitor' ); ?></h2>
+
+            <p><?php esc_html_e( 'Every completion event on this site travels through a fixed sequence of steps. Understanding each step is essential for diagnosing failures.', 'xapi-monitor' ); ?></p>
+
+            <ul class="xapi-pipeline-steps">
+                <li>
+                    <span class="step-num">1</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Articulate Rise content renders in an iframe', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'The Rise course runs inside a browser iframe embedded in the LearnDash lesson page. When a learner reaches a completion trigger (finishing all slides, passing a knowledge check), Rise generates an xAPI statement in memory.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">2</span>
+                    <div>
+                        <strong><?php esc_html_e( 'xAPI statement POSTed to the ucTinCan virtual endpoint', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'Rise\'s xAPI runtime sends the statement as a JSON POST to the ucTinCan endpoint registered by Tin Canny via WordPress rewrite rules (or the query-string fallback /?ucTinCan=1). This is a browser-to-server HTTP request, not a server-to-server call.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">3</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Tin Canny processes the statement', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'Tin Canny validates the statement, deduplicates it (same statement_id received twice is stored once), and writes a row to wpv5_uotincan_reporting. The relevant columns for completion are: verb (passed/completed), completion (1/0), and passed (1/0).', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">4</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Tin Canny triggers LearnDash completion', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'If the statement\'s verb matches Tin Canny\'s configured completion verb(s) (default: "completed" or "passed"), Tin Canny calls learndash_process_mark_complete() on the corresponding lesson_id and course_id. This is the only bridge between the LRS and the LMS.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">5</span>
+                    <div>
+                        <strong><?php esc_html_e( 'LearnDash updates user activity tables', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'LearnDash marks the lesson complete in its own activity tables and recalculates course progress. If the lesson was the last incomplete step, the course is marked complete. If any step remains — including a quiz step that xAPI cannot trigger — the course stays at N-1/N.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+            </ul>
+        </div>
+
+        <?php /* ===== SECTION 2: VERB TABLE ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 2: xAPI Verbs and What They Mean', 'xapi-monitor' ); ?></h2>
+
+            <p><?php esc_html_e( 'xAPI verbs are identified by URIs (Internationalized Resource Identifiers), not plain words. The ADL vocabulary registry defines the canonical IRIs and their natural-language meanings. Not all verbs carry the same weight in a completion workflow.', 'xapi-monitor' ); ?></p>
+
+            <table class="xapi-verb-table">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e( 'Verb', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'IRI', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'Semantic Meaning', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'Used by Tin Canny for completion?', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'Triggers LearnDash?', 'xapi-monitor' ); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>attempted</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/attempted</code></td>
+                        <td><?php esc_html_e( 'The learner started the activity. Does not imply any result.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong>experienced</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/experienced</code></td>
+                        <td><?php esc_html_e( 'The learner was exposed to the activity. Weakest intent — no completion implied.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong>answered</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/answered</code></td>
+                        <td><?php esc_html_e( 'The learner responded to a question. Used for knowledge check interactions.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong>passed</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/passed</code></td>
+                        <td><?php esc_html_e( 'The learner met the passing criterion. Implies a result/score threshold was met.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#1d8348;font-weight:600"><?php esc_html_e( 'Yes (default)', 'xapi-monitor' ); ?></td>
+                        <td style="color:#1d8348;font-weight:600"><?php esc_html_e( 'Yes', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong>failed</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/failed</code></td>
+                        <td><?php esc_html_e( 'The learner did not meet the passing criterion. LearnDash will not mark complete.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                        <td style="color:#c0392b"><?php esc_html_e( 'No', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong>completed</strong></td>
+                        <td><code style="font-size:11px">http://adlnet.gov/expapi/verbs/completed</code></td>
+                        <td><?php esc_html_e( 'The learner finished all required parts of the activity. Primary completion signal for most Rise content.', 'xapi-monitor' ); ?></td>
+                        <td style="color:#1d8348;font-weight:600"><?php esc_html_e( 'Yes (default)', 'xapi-monitor' ); ?></td>
+                        <td style="color:#1d8348;font-weight:600"><?php esc_html_e( 'Yes', 'xapi-monitor' ); ?></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="xapi-scholarly-note">
+                <p style="margin:0"><strong><?php esc_html_e( 'Note on verb informality:', 'xapi-monitor' ); ?></strong>
+                <?php esc_html_e( 'The xAPI specification defines verbs as URIs with informal natural-language semantics. Vidal et al. (2018) demonstrated through ontological analysis that this informality produces ambiguity in real implementations — different authoring tools and LRS platforms may assign different completion logic to the same verb. Tin Canny\'s interpretation of "passed" vs. "completed" (accepting either for completion by default) reflects one vendor\'s reading of an underspecified standard. This is a documented source of interoperability failures.', 'xapi-monitor' ); ?></p>
+            </div>
+        </div>
+
+        <?php /* ===== SECTION 3: WHY COMPLETIONS FAIL ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 3: Why Completions Fail — Common Patterns', 'xapi-monitor' ); ?></h2>
+
+            <div class="xapi-scholarly-note">
+                <p style="margin:0"><?php esc_html_e( 'These failure patterns are not merely implementation bugs — they reflect structural limitations identified in the learning analytics literature. Nouira et al. (2018) argue that xAPI\'s data model has inherent "weaknesses from an assessment point of view," noting the standard was not designed with quiz-step semantics in mind. Ahmad et al. (2022) found in a systematic review that learning analytics implementations frequently suffer from misalignment between data collection systems and learning design — precisely the condition that produces completion mismatches between an LRS (Tin Canny) and an LMS (LearnDash).', 'xapi-monitor' ); ?></p>
+            </div>
+
+            <ol style="margin:12px 0 0 20px;line-height:2">
+                <li>
+                    <strong><?php esc_html_e( 'Quiz Step Gap', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'A course has a quiz step that xAPI cannot trigger. LearnDash requires the quiz to be submitted in-browser. xAPI cannot send a "quiz passed" statement that LearnDash will honor for step completion. The course will remain stuck at N-1/N steps regardless of how many xAPI statements are received.', 'xapi-monitor' ); ?>
+                </li>
+                <li>
+                    <strong><?php esc_html_e( 'Verb Mismatch', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'Content sends "experienced" but Tin Canny is configured to require "completed" or "passed." Check Tin Canny → Modules settings for the configured completion verb. This is a direct instance of the informality problem Vidal et al. (2018) identified.', 'xapi-monitor' ); ?>
+                </li>
+                <li>
+                    <strong><?php esc_html_e( 'Duplicate Statements', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'The same statement_id is received multiple times (e.g., because the learner refreshed the page or the Rise runtime retried on error). Tin Canny deduplicates by statement_id — only the first is stored. If the duplicate carried a different verb, the stored record may not be the completion statement.', 'xapi-monitor' ); ?>
+                </li>
+                <li>
+                    <strong><?php esc_html_e( 'Iframe Delivery Failure', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'Rise content is in an iframe that cannot reach the ucTinCan endpoint due to CORS restrictions, LiteSpeed cache interference, or cookie-based authentication requirements. The statement never arrives at the server. The JavaScript beacon in this plugin detects these cases by monitoring XHR/Fetch calls from within the iframe.', 'xapi-monitor' ); ?>
+                </li>
+                <li>
+                    <strong><?php esc_html_e( 'Score Threshold Not Met', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'Tin Canny is configured with a minimum score threshold (result > X). The learner\'s score was below the threshold, so even though a "passed" verb arrived, Tin Canny rejected it as not meeting the completion criterion.', 'xapi-monitor' ); ?>
+                </li>
+                <li>
+                    <strong><?php esc_html_e( 'LearnDash Step Count Mismatch', 'xapi-monitor' ); ?></strong> —
+                    <?php esc_html_e( 'A course reports N steps in LearnDash but only N−1 can be completed via xAPI. The Nth step is a quiz (see Quiz Step Gap above). The course progress display correctly shows N−1/N because the quiz step is genuinely incomplete from LearnDash\'s perspective.', 'xapi-monitor' ); ?>
+                </li>
+            </ol>
+        </div>
+
+        <?php /* ===== SECTION 4: HOW THIS PLUGIN HELPS ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 4: How This Plugin Helps', 'xapi-monitor' ); ?></h2>
+
+            <p><?php esc_html_e( 'Each tab in this dashboard addresses a specific layer of the pipeline. Every diagnostic finding links to raw DB rows, so every conclusion is verifiable — not inferred.', 'xapi-monitor' ); ?></p>
+
+            <table class="wp-list-table widefat" style="max-width:800px">
+                <thead>
+                    <tr>
+                        <th style="width:160px"><?php esc_html_e( 'Tab', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'What It Shows', 'xapi-monitor' ); ?></th>
+                        <th><?php esc_html_e( 'Source Tables', 'xapi-monitor' ); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong><?php esc_html_e( 'Live Statement Feed', 'xapi-monitor' ); ?></strong></td>
+                        <td><?php esc_html_e( 'Every xAPI statement captured in the last 24 hours (default), with verb, delivery status, HTTP response code, and raw JSON. Filterable by user, verb, status, and date range.', 'xapi-monitor' ); ?></td>
+                        <td><code><?php echo esc_html( $this->log_table ); ?></code></td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php esc_html_e( 'Alerts & Diagnostics', 'xapi-monitor' ); ?></strong></td>
+                        <td><?php esc_html_e( 'Automatically generated alerts for completion mismatches (Tin Canny has data but LearnDash doesn\'t), statement gaps, endpoint failures, and high failure rates. Each mismatch alert now includes an evidence payload with the raw Tin Canny rows, LearnDash activity record, and log IDs that prove the finding.', 'xapi-monitor' ); ?></td>
+                        <td><code><?php echo esc_html( $this->alerts_table ); ?></code></td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php esc_html_e( 'User Diagnostic', 'xapi-monitor' ); ?></strong></td>
+                        <td><?php esc_html_e( 'Per-user side-by-side comparison: for each lesson in each course, shows which xAPI verbs were received, whether Tin Canny recorded a completion, and whether LearnDash shows the lesson as complete. Highlights mismatches. Now also detects quiz steps that xAPI cannot trigger.', 'xapi-monitor' ); ?></td>
+                        <td><code><?php echo esc_html( $this->log_table ); ?></code>, <code><?php echo esc_html( $this->db->prefix . 'uotincan_reporting' ); ?></code>, LearnDash activity</td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php esc_html_e( 'System Health', 'xapi-monitor' ); ?></strong></td>
+                        <td><?php esc_html_e( 'Endpoint connectivity, LearnDash REST API status, hourly statement capture rates and failure percentages, environment info (WP/PHP/plugin versions), DB table sizes, and Tin Canny settings.', 'xapi-monitor' ); ?></td>
+                        <td><?php esc_html_e( 'Live WP environment + information_schema', 'xapi-monitor' ); ?></td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php esc_html_e( 'Settings', 'xapi-monitor' ); ?></strong></td>
+                        <td><?php esc_html_e( 'Configure email alert recipients, statement gap timeout, failure rate threshold, JS beacon toggle, log retention, and diagnostic schedule.', 'xapi-monitor' ); ?></td>
+                        <td><?php esc_html_e( 'wp_options (xapi_monitor_settings)', 'xapi-monitor' ); ?></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p style="margin-top:12px"><?php esc_html_e( 'The REST API endpoints (/xapi-monitor/v1/logs, /logs/{id}, /alerts) expose all monitoring data programmatically, enabling integration with n8n workflows, external dashboards, or custom reporting tools.', 'xapi-monitor' ); ?></p>
+        </div>
+
+        <?php /* ===== SECTION 5: STATEMENT LIFECYCLE ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h2><?php esc_html_e( 'Section 5: xAPI Statement Lifecycle', 'xapi-monitor' ); ?></h2>
+
+            <p><?php esc_html_e( 'An xAPI statement is a structured JSON document with a defined anatomy: Actor–Verb–Object, with optional Result and Context extensions. Here is how each field maps to what you see in the Live Statement Feed.', 'xapi-monitor' ); ?></p>
+
+            <ul class="xapi-pipeline-steps">
+                <li>
+                    <span class="step-num">1</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Authoring tool generates the statement', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'Articulate Rise constructs the statement using its xAPI runtime. The Actor is identified by the learner\'s email (mbox) pulled from the LMS session. The Verb is selected based on the completion trigger (all slides viewed → completed; knowledge check passed → passed). The Object is the activity IRI — typically the course URL or a unique activity ID configured in Rise.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">2</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Actor identified by email', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'The actor.mbox field contains "mailto:user@example.com". Tin Canny maps this to a WordPress user_id by matching against wp_users.user_email. If the email does not match any user, the statement is stored but may not trigger completion.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">3</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Result includes score/completion/success', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'The optional Result object carries result.completion (bool), result.success (bool), and result.score.scaled (0.0–1.0). These map to the result_completion, result_success, and result_score_scaled columns in the monitor log. A statement can have verb=completed but result.success=false — this is not a contradiction in xAPI terms but may confuse downstream systems.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">4</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Statement POSTed to ucTinCan', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'The Rise runtime sends the statement as a JSON-encoded HTTP POST. On this site the endpoint is the Tin Canny virtual endpoint (ucTinCan). The statement includes an X-Experience-API-Version header (1.0.3). If this request fails (network error, server 500, CORS rejection), the learner\'s completion is never recorded.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">5</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Tin Canny validates, deduplicates, stores', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'Tin Canny checks the statement_id. If it has been seen before, the statement is discarded (deduplication). Otherwise it is written to wpv5_uotincan_reporting with the lesson_id and course_id from its module configuration (not from the xAPI statement itself — Tin Canny resolves these from internal metadata).', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">6</span>
+                    <div>
+                        <strong><?php esc_html_e( 'Hook fires → LearnDash notified', 'xapi-monitor' ); ?></strong><br>
+                        <span style="color:#555;font-size:13px"><?php esc_html_e( 'After storage, Tin Canny evaluates whether the stored verb satisfies its completion rule. If yes, it calls learndash_process_mark_complete($user, $lesson_id). LearnDash then updates its user activity tables and recalculates course progress. This plugin observes both the incoming statement (tincanny_before_process_request) and the outgoing result (tincanny_module_result_processed) to confirm the full chain executed.', 'xapi-monitor' ); ?></span>
+                    </div>
+                </li>
+            </ul>
+        </div>
+
+        <?php /* ===== SECTION 6: REFERENCES ===== */ ?>
+        <div class="card xapi-docs-section" style="padding:20px;margin-bottom:20px">
+            <h3><?php esc_html_e( 'References', 'xapi-monitor' ); ?></h3>
+
+            <p class="xapi-reference">Ahmad, A., Griffiths, D., Schiffner, D., Biedermann, D., Drachsler, H., Schneider, J., &amp; Greller, W. (2022). Connecting the dots — A literature review on learning analytics indicators from a learning design perspective. <em>Journal of Computer Assisted Learning</em>, <em>38</em>(5), 1644–1670. <a href="https://doi.org/10.1111/jcal.12716" target="_blank" rel="noopener noreferrer">https://doi.org/10.1111/jcal.12716</a></p>
+
+            <p class="xapi-reference">Advanced Distributed Learning Initiative. (2016). <em>Experience API (xAPI) specification, version 1.0.3</em>. <a href="https://github.com/adlnet/xAPI-Spec" target="_blank" rel="noopener noreferrer">https://github.com/adlnet/xAPI-Spec</a></p>
+
+            <p class="xapi-reference">Friesen, N. (2013). Learning analytics: Readiness and rewards. <em>Canadian Journal of Learning and Technology</em>, <em>39</em>(4). <a href="https://doi.org/10.21432/T2J01B" target="_blank" rel="noopener noreferrer">https://doi.org/10.21432/T2J01B</a></p>
+
+            <p class="xapi-reference">Khaddar, A. M., Said, Y., Dehbi, A., &amp; Chafiq, T. (2026). An interoperable multi-agent architecture for personalized smart learning using generative AI and learning analytics. <em>International Journal of Advanced Computer Science and Applications</em>, <em>17</em>(4). <a href="https://doi.org/10.14569/ijacsa.2026.0170449" target="_blank" rel="noopener noreferrer">https://doi.org/10.14569/ijacsa.2026.0170449</a></p>
+
+            <p class="xapi-reference">Nouira, A., Cheniti-Belcadhi, L., &amp; Braham, R. (2018). An enhanced xAPI data model supporting assessment analytics. <em>Procedia Computer Science</em>, <em>137</em>, 147–157. <a href="https://doi.org/10.1016/J.PROCS.2018.07.291" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/J.PROCS.2018.07.291</a></p>
+
+            <p class="xapi-reference">Rocha, J. C., Hernández-Leal, E., Ramos, V. F. C., Muñoz, R., Cechinel, C., Primo, T., &amp; Queiroga, E. (2024). Implementing a learning record warehouse for different interoperability specifications in Moodle LMS. In <em>Proceedings of the 2024 International Symposium on Innovation and Intelligence in Education</em>. <a href="https://doi.org/10.1109/SIIE63180.2024.10604489" target="_blank" rel="noopener noreferrer">https://doi.org/10.1109/SIIE63180.2024.10604489</a></p>
+
+            <p class="xapi-reference">Samuelsen, J., Chen, W., &amp; Wasson, B. (2021). Enriching context descriptions for enhanced LA scalability: A case study. <em>Research and Practice in Technology Enhanced Learning</em>, <em>16</em>(1), 11. <a href="https://doi.org/10.1186/s41039-021-00150-2" target="_blank" rel="noopener noreferrer">https://doi.org/10.1186/s41039-021-00150-2</a></p>
+
+            <p class="xapi-reference">Vidal, J. C., Rabelo, T., Lama, M., &amp; Amorim, R. (2018). Ontology-based approach for the validation and conformance testing of xAPI events. <em>Knowledge-Based Systems</em>, <em>158</em>, 101–113. <a href="https://doi.org/10.1016/J.KNOSYS.2018.04.035" target="_blank" rel="noopener noreferrer">https://doi.org/10.1016/J.KNOSYS.2018.04.035</a></p>
+
+            <hr style="margin:16px 0">
+            <p style="font-size:12px;color:#666"><?php esc_html_e( 'External links:', 'xapi-monitor' ); ?>
+                <a href="https://github.com/adlnet/xAPI-Spec" target="_blank" rel="noopener noreferrer">ADL xAPI Specification</a> &bull;
+                <a href="https://www.uncannyowl.com/knowledge-base/" target="_blank" rel="noopener noreferrer">Tin Canny Documentation</a> &bull;
+                <a href="https://developers.learndash.com/" target="_blank" rel="noopener noreferrer">LearnDash Developer Docs</a> &bull;
+                <a href="https://github.com/schoedel-learn/xapi-statement-monitor" target="_blank" rel="noopener noreferrer">This plugin on GitHub</a>
+            </p>
+        </div>
+
+        </div><?php // end max-width wrapper
     }
 }
 
